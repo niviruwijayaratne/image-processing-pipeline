@@ -1,15 +1,16 @@
 """Image Processing Pipeline/"""
-import numpy as np
-from skimage.io import imread, imsave
-import matplotlib.pyplot as plt
 import argparse as ap
 from pathlib import Path
-from scipy.interpolate import interpn, interp2d
-from scipy import signal
-import torch
-import torch.nn.functional as F
-from skimage.color import rgb2gray
+
+import cv2
+import matplotlib.patches as patches
+import matplotlib.pyplot as plt
+import numpy as np
 from PIL import Image
+from scipy.interpolate import interp2d
+from skimage.color import rgb2gray
+from skimage.io import imread
+from skimage.transform import rescale
 
 
 def read_im(im_path: Path) -> np.ndarray:
@@ -165,12 +166,12 @@ def white_balance(linear_image: np.ndarray,
     Returns:
       White balanced image.
     """
-
-    red_data, green_data, blue_data = get_bayer_data(
-        linear_image, bayer_pattern=bayer_pattern)
-    red_mask = red_data[-1]
-    green_mask = green_data[-1]
-    blue_mask = blue_data[-1]
+    if not method == "manual":
+        red_data, green_data, blue_data = get_bayer_data(
+            linear_image, bayer_pattern=bayer_pattern)
+        red_mask = red_data[-1]
+        green_mask = green_data[-1]
+        blue_mask = blue_data[-1]
 
     if method == "white":
         r_max = linear_image[red_mask].max()
@@ -189,6 +190,49 @@ def white_balance(linear_image: np.ndarray,
     elif method == "preset":
         linear_image[red_mask] = linear_image[red_mask] * 2.394531
         linear_image[blue_mask] = linear_image[blue_mask] * 1.597656
+    elif method == "manual":
+        if not linear_image.shape[-1] == 3:
+            raise RuntimeError(
+                "For manual white balancing, please pass in an RGB image.")
+
+        # Create figure for manual selection.
+        _, ax = plt.subplots()
+        # Downsample image for display purposes.
+        downscale = 8
+        display_image = rescale(linear_image, 1 / downscale)
+        ax.imshow(display_image, cmap="gray")
+        top_left, bottom_right = plt.ginput(n=2, timeout=0)
+        plt.close("all")
+
+        # Draw Rectangle on Image and Show
+        _, ax = plt.subplots()
+        rect = patches.Rectangle(top_left,
+                                 bottom_right[0] - top_left[0],
+                                 top_left[1] - bottom_right[1],
+                                 linewidth=1,
+                                 edgecolor='r',
+                                 facecolor='none')
+        ax.add_patch(rect)
+        ax.imshow(display_image, cmap="gray")
+        plt.show()
+
+        # Extract white patch from image.
+        start_y = int(top_left[1]) * downscale
+        end_y = int(bottom_right[1]) * downscale
+        start_x = int(top_left[0]) * downscale
+        end_x = int(bottom_right[0]) * downscale
+        white_patch = linear_image[start_y:end_y, start_x:end_x]
+
+        # Normalize and clip image based on white patch.
+        linear_image /= white_patch.max(axis=(0, 1))
+        linear_image = np.clip(linear_image, 0.0, 1.0)
+
+        # Draw patch on image.
+        pad = 8
+        linear_image[start_y:end_y + pad, start_x:start_x + pad] = [1, 0, 0]
+        linear_image[start_y:start_y + pad, start_x:end_x + pad] = [1, 0, 0]
+        linear_image[start_y:end_y + pad, end_x:end_x + pad] = [1, 0, 0]
+        linear_image[end_y:end_y + pad, start_x:end_x + pad] = [1, 0, 0]
     else:
         raise RuntimeError(
             "Please select one of [white, grey, preset] for white balancing!")
@@ -361,9 +405,10 @@ def main(args):
     white_balance_mode = str(args.white_balance)
     brightness_percentage = float(args.brightness_percentage) / 100.0
     # Create output directory based on settings.
-    out_dir = src_dir / white_balance_mode / bayer_pattern
+    out_dir = Path(args.out_dir) / white_balance_mode / bayer_pattern
     if not out_dir.exists():
         out_dir.mkdir(parents=True, exist_ok=False)
+
     output_img_format = str(args.output_img_format)
     compression_quality = int(args.compression_quality)
 
@@ -372,16 +417,26 @@ def main(args):
     linear_im = linearize(im)
 
     print("White Balancing...")
-    white_balanced_im = white_balance(linear_im,
-                                      bayer_pattern=bayer_pattern,
-                                      method=white_balance_mode)
-    write_im(out_dir / f"1_white_balanced.{output_img_format}",
-             white_balanced_im, compression_quality)
+    if not white_balance_mode == "manual":
+        white_balanced_im = white_balance(linear_im,
+                                          bayer_pattern=bayer_pattern,
+                                          method=white_balance_mode)
+        write_im(out_dir / f"1_white_balanced.{output_img_format}",
+                 white_balanced_im, compression_quality)
+    else:
+        white_balanced_im = linear_im
 
     print("Demosaicing...")
     demosaiced_image = demosaic(white_balanced_im, bayer_pattern=bayer_pattern)
     write_im(out_dir / f"2_demosaiced.{output_img_format}", demosaiced_image,
              compression_quality)
+
+    if white_balance_mode == "manual":
+        demosaiced_image = white_balance(demosaiced_image,
+                                         bayer_pattern=bayer_pattern,
+                                         method=white_balance_mode)
+        write_im(out_dir / f"1_white_balanced.{output_img_format}",
+                 white_balanced_im, compression_quality)
 
     print("Correcting Color Space...")
     color_space_corrected_img = color_space_correction(demosaiced_image)
@@ -399,11 +454,31 @@ def main(args):
 
 if __name__ == "__main__":
     parser = ap.ArgumentParser()
-    parser.add_argument("--src_dir", type=str, default="./data")
-    parser.add_argument("--bayer_pattern", type=str, default="rggb")
-    parser.add_argument("--white_balance", type=str, default="grey")
-    parser.add_argument("--brightness_percentage", type=float, default=20)
-    parser.add_argument("--output_img_format", type=str, default="png")
-    parser.add_argument("--compression_quality", type=int, default=95)
+    parser.add_argument("--src_dir",
+                        type=str,
+                        default="../data",
+                        required=True)
+    parser.add_argument("--bayer_pattern",
+                        type=str,
+                        default="rggb",
+                        required=True)
+    parser.add_argument("--white_balance",
+                        type=str,
+                        default="grey",
+                        required=True)
+    parser.add_argument("--brightness_percentage",
+                        type=float,
+                        default=20,
+                        required=True)
+    parser.add_argument("--output_img_format",
+                        type=str,
+                        default="png",
+                        required=True)
+    parser.add_argument("--compression_quality",
+                        type=int,
+                        default=95,
+                        required=False)
+    parser.add_argument("--out_dir", type=str, default="./data", required=True)
     args = parser.parse_args()
+
     main(args)
